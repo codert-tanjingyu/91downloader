@@ -100,6 +100,7 @@ async def extract_m3u8_url(
     page_url: str,
     session: AsyncSession,
     use_playwright: bool = False,
+    headed: bool = False,
 ) -> str:
     """
     提取目标视频页面中的 M3U8 播放列表 URL。
@@ -116,8 +117,9 @@ async def extract_m3u8_url(
         ValueError: 无法从页面提取到有效的 M3U8 URL
     """
     if use_playwright:
-        logger.info("使用 Playwright 动态模式提取 M3U8 URL ...")
-        return await _extract_via_playwright(page_url)
+        mode = "有头（可见窗口）" if headed else "无头"
+        logger.info("使用 Playwright %s 模式提取 M3U8 URL ...", mode)
+        return await _extract_via_playwright(page_url, headed=headed)
 
     logger.info("使用静态模式提取 M3U8 URL: %s", page_url)
     return await _extract_static(page_url, session)
@@ -271,14 +273,17 @@ def _is_hls_response(url: str, content_type: str) -> bool:
     return ct in _HLS_CONTENT_TYPES
 
 
-async def _extract_via_playwright(page_url: str) -> str:
+async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
     """
-    使用 Playwright 无头 Chromium 加载页面提取 M3U8 URL。
+    使用 Playwright Chromium 加载页面提取 M3U8 URL。
 
     策略：
       1. 加载页面（跳过 DOM 读取，DOM 中的视频地址为诱饵）
       2. 点击播放按钮，触发广告 → 正片流程
       3. 纯靠网络响应拦截等待真实 M3U8 请求，最多 120 秒
+
+    参数：
+      headed: True 时弹出可见浏览器窗口（便于调试观察）
 
     注意：调用前需确保已执行 `playwright install chromium`。
     """
@@ -296,7 +301,7 @@ async def _extract_via_playwright(page_url: str) -> str:
             # ── 启动浏览器 ──
             try:
                 browser = await pw.chromium.launch(
-                    headless=True,
+                    headless=not headed,
                     args=[
                         "--no-sandbox",
                         "--disable-setuid-sandbox",
