@@ -106,7 +106,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--use-playwright",
         action="store_true",
         default=False,
-        help="启用 Playwright 无头浏览器动态拦截 M3U8（默认不启用，需安装：playwright install chromium）",
+        help="启用 Playwright 浏览器动态拦截 M3U8（默认不启用，需安装：playwright install chromium）",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        default=False,
+        help="配合 --use-playwright 使用：弹出可见浏览器窗口（默认无头），便于调试观察",
     )
     parser.add_argument(
         "--interactive",
@@ -202,6 +208,7 @@ async def download_pipeline(args: argparse.Namespace) -> None:
                 args.url,
                 session,
                 use_playwright=args.use_playwright,
+                headed=args.headed,
             )
             logger.info("播放地址: %s", media_url)
 
