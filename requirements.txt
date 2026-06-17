@@ -1,0 +1,9 @@
+curl_cffi>=0.5.10        # TLS/JA3 指纹绕过与异步支持
+beautifulsoup4>=4.12.0   # HTML 结构解析
+lxml>=4.9.0              # BeautifulSoup 高速解析器后端
+m3u8>=3.0.0              # 标准 M3U8 解析
+pycryptodome>=3.19.0     # AES-128 解密
+tqdm>=4.66.0             # 终端进度条
+playwright>=1.40.0       # 动态渲染引擎（可选，需 --use-playwright 开启）
+python-dotenv>=1.0.0     # 读取 .env 配置文件
+aiofiles>=23.2.0         # 异步文件写入
