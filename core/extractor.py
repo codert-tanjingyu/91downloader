@@ -275,12 +275,10 @@ async def _extract_via_playwright(page_url: str) -> str:
     """
     使用 Playwright 无头 Chromium 加载页面提取 M3U8 URL。
 
-    策略（按优先级）：
-      1. 页面 load 后直接读 DOM 中 <source> / <video> 的 src 属性
-         —— 91porn 的 strencode JS 在内联脚本执行阶段就已写入 DOM，
-            无需等待网络请求，这是最快最可靠的方式。
-      2. 若 DOM 未命中，点击播放按钮后再次轮询 DOM，
-         同时保留网络响应拦截作为兜底。
+    策略：
+      1. 加载页面（跳过 DOM 读取，DOM 中的视频地址为诱饵）
+      2. 点击播放按钮，触发广告 → 正片流程
+      3. 纯靠网络响应拦截等待真实 M3U8 请求，最多 120 秒
 
     注意：调用前需确保已执行 `playwright install chromium`。
     """
@@ -290,26 +288,6 @@ async def _extract_via_playwright(page_url: str) -> str:
         raise ImportError(
             "Playwright 未安装，请执行：pip install playwright && playwright install chromium"
         ) from exc
-
-    # 从 DOM 中读取播放地址的 JS 片段（m3u8 优先，mp4 兜底）
-    _JS_READ_DOM = """() => {
-        const selectors = [
-            'source[src*=".m3u8"]',
-            'video[src*=".m3u8"]',
-            'source[src*=".mp4"]',
-            'video[src*=".mp4"]',
-            'video source[src]',
-            'source[src]',
-        ];
-        for (const sel of selectors) {
-            const el = document.querySelector(sel);
-            if (el) {
-                const src = el.src || el.getAttribute('src') || '';
-                if (src && src.startsWith('http')) return src;
-            }
-        }
-        return '';
-    }"""
 
     intercepted_url: list[str] = []
 
@@ -348,7 +326,7 @@ async def _extract_via_playwright(page_url: str) -> str:
             )
             page = await context.new_page()
 
-            # ── 网络响应拦截（兜底备用）──
+            # ── 网络响应拦截 ──
             async def on_response(response):
                 if intercepted_url:
                     return
@@ -363,43 +341,40 @@ async def _extract_via_playwright(page_url: str) -> str:
 
             page.on("response", on_response)
 
-            # ── 加载页面，等待内联脚本执行完毕 ──
+            # ── 加载页面 ──
             logger.info("正在加载页面 ...")
             await page.goto(page_url, wait_until="load", timeout=60_000)
-            logger.debug("页面 load 事件已触发")
+            logger.debug("页面 load 事件已触发，跳过 DOM 读取（DOM 中为诱饵视频）")
 
-            # ── 优先：直接从 DOM 读取（strencode 已在内联阶段写入）──
-            logger.info("尝试从 DOM 读取播放地址 ...")
-            dom_url = await page.evaluate(_JS_READ_DOM)
-            if dom_url and dom_url.startswith("http"):
-                logger.info("✅ 从 DOM 读取到播放地址: %s", dom_url)
-                await browser.close()
-                return dom_url
-
-            # ── DOM 未命中：尝试点击播放按钮，轮询 DOM + 网络拦截 ──
-            logger.info("DOM 未命中，尝试点击播放按钮 ...")
+            # ── 点击播放按钮，触发广告 → 正片流程 ──
+            logger.info("尝试点击播放按钮 ...")
+            clicked = False
             for selector in _PLAY_BUTTON_SELECTORS:
                 try:
                     element = page.locator(selector).first
                     if await element.count() > 0:
                         await element.click(timeout=3_000)
-                        logger.debug("已点击播放按钮: %s", selector)
+                        logger.info("已点击播放按钮: %s", selector)
+                        clicked = True
                         break
                 except Exception as e:
                     logger.debug("选择器 %s 点击失败: %s", selector, e)
 
-            # 点击后轮询（最多 10 秒），DOM 和网络拦截都算成功
-            for _ in range(20):
-                dom_url = await page.evaluate(_JS_READ_DOM)
-                if dom_url and dom_url.startswith("http"):
-                    logger.info("✅ 点击后从 DOM 读取到播放地址: %s", dom_url)
-                    await browser.close()
-                    return dom_url
+            if not clicked:
+                logger.warning("未能找到播放按钮，继续等待网络请求 ...")
+
+            # ── 轮询等待真实 M3U8 请求（最多 120 秒）──
+            logger.info("等待广告播放完毕，轮询拦截 M3U8 请求（最多 120 秒）...")
+            _MAX_WAIT_SEC = 120.0
+            _POLL_SEC = 0.5
+            elapsed = 0.0
+            while elapsed < _MAX_WAIT_SEC:
                 if intercepted_url:
-                    logger.info("✅ 网络拦截兜底成功")
+                    logger.info("✅ 拦截到真实 M3U8（等待 %.1f 秒后）: %s", elapsed, intercepted_url[0])
                     await browser.close()
                     return intercepted_url[0]
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(_POLL_SEC)
+                elapsed += _POLL_SEC
 
             await browser.close()
 
@@ -409,10 +384,11 @@ async def _extract_via_playwright(page_url: str) -> str:
         raise RuntimeError(f"Playwright 运行时发生异常: {exc}") from exc
 
     raise ValueError(
-        "Playwright 未能获取到 HLS 播放列表 URL。\n\n"
+        "Playwright 未能在 120 秒内拦截到 HLS 播放列表 URL。\n\n"
         "可能原因：\n"
         "  1. 该视频需要登录/Cookie 才能播放 → 在 .env 中配置 COOKIE\n"
-        "  2. 视频播放器使用了非标准 HLS 分发方式\n"
-        "  3. 网络超时，未能完成加载 → 检查代理配置\n\n"
+        "  2. 广告时长超出等待上限（120 秒）\n"
+        "  3. 视频播放器使用了非标准 HLS 分发方式\n"
+        "  4. 网络超时，未能完成加载 → 检查代理配置\n\n"
         f"页面地址: {page_url}"
     )
