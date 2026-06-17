@@ -160,7 +160,7 @@ async def _stream_merge(
     """
     chunk_size = config.WRITE_CHUNK_SIZE
 
-    async def _process_and_write():
+    def _process_and_write():
         with open(output_ts, "wb") as out_f:
             for path, seg in zip(paths, segments):
                 if path is None or not path.exists():

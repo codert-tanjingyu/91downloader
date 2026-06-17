@@ -367,3 +367,55 @@ async def download_segments(
     )
 
     return valid_video, valid_audio
+
+
+async def download_direct_mp4(
+    url: str,
+    output_path: Path,
+    session: AsyncSession,
+    referer: str = "",
+) -> Path:
+    """
+    流式下载 MP4 直链，带进度条。
+
+    参数：
+        url: MP4 文件直链
+        output_path: 输出路径（不含扩展名）
+        session: curl_cffi AsyncSession（自带 TLS 指纹 + Cookie）
+        referer: Referer 请求头，填视频页面 URL
+
+    返回：
+        实际写入的文件路径（.mp4）
+    """
+    final_path = output_path.with_suffix(".mp4")
+    extra_headers = {"Referer": referer} if referer else {}
+
+    logger.info("开始流式下载 MP4: %s", url)
+    resp = await session.get(
+        url,
+        headers=extra_headers,
+        stream=True,
+        timeout=config.DOWNLOAD_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"MP4 下载失败，HTTP {resp.status_code}: {url}")
+
+    total = int(resp.headers.get("content-length", 0)) or None
+
+    with async_tqdm(
+        total=total,
+        desc="下载进度",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        dynamic_ncols=True,
+        colour="cyan",
+    ) as pbar:
+        async with aiofiles.open(final_path, "wb") as f:
+            async for chunk in resp.aiter_content(chunk_size=config.WRITE_CHUNK_SIZE):
+                await f.write(chunk)
+                pbar.update(len(chunk))
+
+    size_mb = final_path.stat().st_size / 1024 / 1024
+    logger.info("MP4 下载完成: %s (%.1f MB)", final_path, size_mb)
+    return final_path

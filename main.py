@@ -130,6 +130,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_m3u8_url(url: str) -> bool:
+    """判断 URL 是否为 M3U8 播放列表（而非 MP4 直链）。"""
+    return ".m3u8" in url.lower()
+
+
 def _resolve_output_name(url: str, override: str) -> str:
     """
     根据 URL 推导输出文件名（不含扩展名）。
@@ -172,7 +177,7 @@ async def download_pipeline(args: argparse.Namespace) -> None:
     from utils.http_client import get_session
     from core.extractor import extract_m3u8_url
     from core.parser import parse_m3u8
-    from core.downloader import download_segments
+    from core.downloader import download_segments, download_direct_mp4
     from core.merger import merge_segments
 
     # 命令行参数覆盖 config
@@ -187,27 +192,39 @@ async def download_pipeline(args: argparse.Namespace) -> None:
     output_path = config.OUTPUT_DIR / output_name
 
     async with get_session() as session:
-        # ── 阶段 1：获取 M3U8 URL ──
+        # ── 阶段 1：提取播放地址（M3U8 或 MP4 直链）──
         if args.m3u8:
-            m3u8_url = args.url
-            logger.info("直接使用 M3U8 链接: %s", m3u8_url)
+            media_url = args.url
+            logger.info("直接使用 M3U8 链接: %s", media_url)
         else:
             logger.info("正在解析视频页面 ...")
-            m3u8_url = await extract_m3u8_url(
+            media_url = await extract_m3u8_url(
                 args.url,
                 session,
                 use_playwright=args.use_playwright,
             )
-            logger.info("M3U8 URL: %s", m3u8_url)
+            logger.info("播放地址: %s", media_url)
 
         if _cancel_event.is_set():
             logger.info("已取消")
             return
 
-        # ── 阶段 2：解析 M3U8 ──
+        # ── 阶段 2：MP4 直链 → 直接流式下载 ──
+        if not _is_m3u8_url(media_url):
+            logger.info("检测到 MP4 直链，开始直接下载 ...")
+            final_file = await download_direct_mp4(
+                media_url,
+                output_path,
+                session,
+                referer=args.url,
+            )
+            print(f"\n✅ 下载完成！\n   输出文件: {final_file}")
+            return
+
+        # ── 阶段 3：解析 M3U8 ──
         logger.info("正在解析 M3U8 播放列表 ...")
         parse_result = await parse_m3u8(
-            m3u8_url,
+            media_url,
             session,
             prefer_highest=not args.interactive,
             interactive=args.interactive,
@@ -220,7 +237,7 @@ async def download_pipeline(args: argparse.Namespace) -> None:
             logger.info("已取消")
             return
 
-        # ── 阶段 3：并发下载 ──
+        # ── 阶段 4：并发下载分片 ──
         logger.info("开始下载分片 ...")
         video_paths, audio_paths = await download_segments(
             parse_result,
@@ -236,7 +253,7 @@ async def download_pipeline(args: argparse.Namespace) -> None:
         if not video_paths:
             raise RuntimeError("所有视频分片下载失败，无法合并")
 
-        # ── 阶段 4：解密合并 ──
+        # ── 阶段 5：解密合并 ──
         logger.info("开始合并视频 ...")
         final_file = await merge_segments(
             video_paths,
