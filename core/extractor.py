@@ -1,12 +1,12 @@
 """
-core/extractor.py — 页面解析与 M3U8 URL 提取模块
+core/extractor.py — 页面解析与视频 URL 提取模块
 
 职责：
   - 静态路径（默认）：用 curl_cffi 下载页面 HTML，通过正则提取密文和 Key，
-    调用 decoder.str_decode 还原真实 M3U8 URL。
-  - 动态路径（可选，--use-playwright）：启动 Playwright 无头 Chromium，
-    监听网络响应（含 Content-Type 检测），自动点击播放按钮触发 HLS 请求，
-    直接拦截加载后的真实 M3U8 URL，无需破解混淆逻辑。
+    调用 decoder.str_decode 还原真实视频 URL。
+  - 动态路径（可选，--use-playwright）：启动 Playwright Chromium，
+    用全新 context 两次访问目标页面：第一次让页面 JS 写入 cookie，
+    第二次携带 cookie 后 DOM 中 <source src> 即为真实视频地址。
 
 注意：
   Playwright 仅在用户通过 --use-playwright 参数显式开启时才会被导入和使用。
@@ -14,7 +14,6 @@ core/extractor.py — 页面解析与 M3U8 URL 提取模块
   静态模式依然正常运行。
 """
 
-import asyncio
 import json
 import re
 import logging
@@ -27,16 +26,6 @@ from core.decoder import str_decode, try_extract_m3u8_from_plaintext
 from utils.http_client import fetch_text
 
 logger = logging.getLogger(__name__)
-
-# ──────────────────────────────────────────────────────────
-# HLS 响应 Content-Type 集合
-# ──────────────────────────────────────────────────────────
-_HLS_CONTENT_TYPES: set[str] = {
-    "application/x-mpegurl",
-    "application/vnd.apple.mpegurl",
-    "audio/mpegurl",
-    "audio/x-mpegurl",
-}
 
 # ──────────────────────────────────────────────────────────
 # 正则模式库
@@ -77,19 +66,6 @@ _RE_DIRECT_M3U8 = re.compile(
     r'["\']?(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)["\']?',
     re.IGNORECASE,
 )
-
-# 播放按钮选择器列表（按优先级依次尝试）
-_PLAY_BUTTON_SELECTORS = [
-    "button.vjs-big-play-button",          # Video.js
-    ".play-button",
-    ".btn-play",
-    "#player .play",
-    "div.play_btn",
-    "div[class*='play']",
-    ".dplayer-play-icon",                  # DPlayer
-    ".jw-icon-display",                    # JW Player
-    "video",                               # 直接点击 video 元素
-]
 
 
 # ──────────────────────────────────────────────────────────
@@ -254,33 +230,17 @@ def _ensure_absolute(url: str, base_url: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────
-# Playwright 动态拦截（可选）
+# Playwright 动态提取（可选）
 # ──────────────────────────────────────────────────────────
-
-def _is_hls_response(url: str, content_type: str) -> bool:
-    """
-    判断一个网络响应是否为 HLS 播放列表。
-
-    检测两个维度：
-      1. URL 中包含 .m3u8 字符串
-      2. Content-Type 为标准 HLS MIME 类型
-
-    两个条件满足其一即判定为 HLS。
-    """
-    if ".m3u8" in url:
-        return True
-    ct = content_type.lower().split(";")[0].strip()
-    return ct in _HLS_CONTENT_TYPES
-
 
 async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
     """
-    使用 Playwright Chromium 加载页面提取 M3U8 URL。
+    使用 Playwright Chromium 加载页面提取视频 URL。
 
     策略：
-      1. 加载页面（跳过 DOM 读取，DOM 中的视频地址为诱饵）
-      2. 点击播放按钮，触发广告 → 正片流程
-      3. 纯靠网络响应拦截等待真实 M3U8 请求，最多 120 秒
+      1. 全新 context（零 cookie），第一次 goto 让页面 JS 写入 cookie
+      2. 同一 page 再次 goto，这次请求携带 cookie，DOM 中 <source src> 为真实视频地址
+      3. 读取 DOM 中第一个有效 <source src> 并返回
 
     参数：
       headed: True 时弹出可见浏览器窗口（便于调试观察）
@@ -294,7 +254,11 @@ async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
             "Playwright 未安装，请执行：pip install playwright && playwright install chromium"
         ) from exc
 
-    intercepted_url: list[str] = []
+    _JS_READ_SOURCE = """() => {
+        const el = document.querySelector('source[src]');
+        if (!el) return '';
+        return el.src || el.getAttribute('src') || '';
+    }"""
 
     try:
         async with async_playwright() as pw:
@@ -319,7 +283,7 @@ async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
                     ) from exc
                 raise
 
-            # ── 创建上下文（模拟真实浏览器） ──
+            # ── 创建上下文（全新，零 cookie）──
             context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -331,57 +295,22 @@ async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
             )
             page = await context.new_page()
 
-            # ── 网络响应拦截 ──
-            async def on_response(response):
-                if intercepted_url:
-                    return
-                url = response.url
-                try:
-                    ct = response.headers.get("content-type", "")
-                except Exception:
-                    ct = ""
-                if _is_hls_response(url, ct):
-                    intercepted_url.append(url)
-                    logger.info("✅ 网络拦截到 HLS 播放列表: %s", url)
-
-            page.on("response", on_response)
-
-            # ── 加载页面 ──
-            logger.info("正在加载页面 ...")
+            # ── 第一次访问：让页面 JS 写入 cookie ──
+            logger.info("第一次加载页面（建立 cookie）...")
             await page.goto(page_url, wait_until="load", timeout=60_000)
-            logger.debug("页面 load 事件已触发，跳过 DOM 读取（DOM 中为诱饵视频）")
+            logger.debug("第一次 load 完成")
 
-            # ── 点击播放按钮，触发广告 → 正片流程 ──
-            logger.info("尝试点击播放按钮 ...")
-            clicked = False
-            for selector in _PLAY_BUTTON_SELECTORS:
-                try:
-                    element = page.locator(selector).first
-                    if await element.count() > 0:
-                        await element.click(timeout=3_000)
-                        logger.info("已点击播放按钮: %s", selector)
-                        clicked = True
-                        break
-                except Exception as e:
-                    logger.debug("选择器 %s 点击失败: %s", selector, e)
+            # ── 第二次访问：携带 cookie，DOM 中为真实视频地址 ──
+            logger.info("第二次加载页面（携带 cookie，读取真实视频地址）...")
+            await page.goto(page_url, wait_until="load", timeout=60_000)
+            logger.debug("第二次 load 完成")
 
-            if not clicked:
-                logger.warning("未能找到播放按钮，继续等待网络请求 ...")
-
-            # ── 轮询等待真实 M3U8 请求（最多 120 秒）──
-            logger.info("等待广告播放完毕，轮询拦截 M3U8 请求（最多 120 秒）...")
-            _MAX_WAIT_SEC = 120.0
-            _POLL_SEC = 0.5
-            elapsed = 0.0
-            while elapsed < _MAX_WAIT_SEC:
-                if intercepted_url:
-                    logger.info("✅ 拦截到真实 M3U8（等待 %.1f 秒后）: %s", elapsed, intercepted_url[0])
-                    await browser.close()
-                    return intercepted_url[0]
-                await asyncio.sleep(_POLL_SEC)
-                elapsed += _POLL_SEC
-
+            src = await page.evaluate(_JS_READ_SOURCE)
             await browser.close()
+
+            if src and src.startswith("http"):
+                logger.info("✅ 从 DOM 读取到真实视频地址: %s", src)
+                return src
 
     except RuntimeError:
         raise
@@ -389,11 +318,10 @@ async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
         raise RuntimeError(f"Playwright 运行时发生异常: {exc}") from exc
 
     raise ValueError(
-        "Playwright 未能在 120 秒内拦截到 HLS 播放列表 URL。\n\n"
+        "Playwright 未能从 DOM 中读取到视频地址。\n\n"
         "可能原因：\n"
-        "  1. 该视频需要登录/Cookie 才能播放 → 在 .env 中配置 COOKIE\n"
-        "  2. 广告时长超出等待上限（120 秒）\n"
-        "  3. 视频播放器使用了非标准 HLS 分发方式\n"
-        "  4. 网络超时，未能完成加载 → 检查代理配置\n\n"
+        "  1. 该视频需要登录账号才能播放\n"
+        "  2. 页面结构已更新，<source> 选择器失效\n"
+        "  3. 网络超时，未能完成加载 → 检查代理配置\n\n"
         f"页面地址: {page_url}"
     )
