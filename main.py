@@ -50,21 +50,21 @@ def _build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="91downloader",
-        description="HLS 下载器 — 自动提取 M3U8、并发下载 TS 分片并合并为 MP4",
+        description="视频下载器 — 用 Playwright 自动提取视频地址并下载",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
-  # 下载视频页面（自动提取 M3U8）
+  # 下载视频页面
   python main.py "https://www.91porn.com/view_video.php?viewkey=xxx"
 
-  # 直接传入 M3U8 链接
+  # 弹出浏览器窗口调试观察
+  python main.py <URL> --headed
+
+  # 直接传入 M3U8 链接（跳过页面解析）
   python main.py "https://example.com/video/index.m3u8" --m3u8
 
   # 指定输出名称与代理
   python main.py <URL> --output my_video --proxy socks5://127.0.0.1:7891
-
-  # 使用 Playwright 动态拦截模式（需提前安装：playwright install chromium）
-  python main.py <URL> --use-playwright
 
   # 调整并发数与交互式清晰度选择
   python main.py <URL> --concurrency 4 --interactive
@@ -103,16 +103,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f'并发下载分片数（默认 {config.MAX_CONCURRENCY}）',
     )
     parser.add_argument(
-        "--use-playwright",
-        action="store_true",
-        default=False,
-        help="启用 Playwright 浏览器动态拦截 M3U8（默认不启用，需安装：playwright install chromium）",
-    )
-    parser.add_argument(
         "--headed",
         action="store_true",
         default=False,
-        help="配合 --use-playwright 使用：弹出可见浏览器窗口（默认无头），便于调试观察",
+        help="弹出可见浏览器窗口（默认无头），便于调试观察",
     )
     parser.add_argument(
         "--interactive",
@@ -175,16 +169,15 @@ async def download_pipeline(args: argparse.Namespace) -> None:
     完整的下载流水线协程。
 
     阶段：
-      1. 获取/验证 M3U8 URL
-      2. 解析 M3U8（分片列表、加密信息、音频流）
-      3. 并发下载所有分片
-      4. 解密合并，输出最终视频文件
+      1. Playwright 提取视频地址（MP4 直链优先，降级 M3U8）
+      2. MP4 直链：直接流式下载
+      3. M3U8：解析分片列表 → 并发下载 → 解密合并
     """
-    from utils.http_client import get_session
-    from core.extractor import extract_m3u8_url
+    from core.extractor import extract_video_url
     from core.parser import parse_m3u8
     from core.downloader import download_segments, download_direct_mp4
     from core.merger import merge_segments
+    from utils.http_client import get_session
 
     # 命令行参数覆盖 config
     if args.proxy:
@@ -198,19 +191,13 @@ async def download_pipeline(args: argparse.Namespace) -> None:
     output_path = config.OUTPUT_DIR / output_name
 
     async with get_session() as session:
-        # ── 阶段 1：提取播放地址（M3U8 或 MP4 直链）──
+        # ── 阶段 1：提取播放地址 ──
         if args.m3u8:
             media_url = args.url
             logger.info("直接使用 M3U8 链接: %s", media_url)
         else:
-            logger.info("正在解析视频页面 ...")
-            media_url = await extract_m3u8_url(
-                args.url,
-                session,
-                use_playwright=args.use_playwright,
-                headed=args.headed,
-            )
-            logger.info("播放地址: %s", media_url)
+            media_url = await extract_video_url(args.url, headed=args.headed)
+            logger.info("✅ 获取到视频地址: %s", media_url)
 
         if _cancel_event.is_set():
             logger.info("已取消")
