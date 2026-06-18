@@ -50,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
         prog="91downloader",
-        description="91视频 HLS 下载器 — 自动提取 M3U8、并发下载 TS 分片并合并为 MP4",
+        description="HLS 下载器 — 自动提取 M3U8、并发下载 TS 分片并合并为 MP4",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：
@@ -285,7 +285,7 @@ def main() -> None:
     _setup_signal_handlers()
 
     logger.info("="*50)
-    logger.info(" 91视频 HLS 下载器 启动")
+    logger.info(" 视频 HLS 下载器 启动")
     logger.info("="*50)
     logger.info("目标: %s", args.url)
 
