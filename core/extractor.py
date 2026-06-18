@@ -122,10 +122,10 @@ async def _extract_via_playwright(page_url: str, headed: bool = False) -> str:
 
             # ── 路径 1：两次访问读 DOM → MP4 ──
             logger.info("第一次加载页面（建立 cookie）...")
-            await page.goto(page_url, wait_until="load", timeout=60_000)
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=60_000)
 
             logger.info("第二次加载页面（携带 cookie，读取视频地址）...")
-            await page.goto(page_url, wait_until="load", timeout=60_000)
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=60_000)
 
             src = await page.evaluate(_JS_READ_SOURCE)
             if src and src.startswith("http"):
